@@ -1,268 +1,670 @@
-<!DOCTYPE html>
-<html lang="ar" dir="rtl">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>خط الليل - Night Sun</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
-        body, html { width: 100%; height: 100%; overflow: hidden; background: #000; font-family: sans-serif; }
-        #canvas-container { width: 100%; height: 100%; position: absolute; top: 0; left: 0; }
+using UnityEngine;
+using UnityEngine.EventSystems;
+using System.Collections.Generic;
+using System.IO;
+
+// ========================================================
+// 1. بيانات الحفظ للتصدير إلى JSON
+// ========================================================
+[System.Serializable]
+public class BlockData
+{
+    public int blockType; // 0: Block, 1: Wheel, 2: Thruster
+    public Vector3 localPosition;
+    public Quaternion localRotation;
+}
+
+[System.Serializable]
+public class VehicleSaveData
+{
+    public List<BlockData> blocks = new List<BlockData>();
+}
+
+// ========================================================
+// 2. مكون الصاروخ (Thruster)
+// ========================================================
+public class ThrusterComponent : MonoBehaviour
+{
+    public ParticleSystem thrustParticles;
+
+    public void SetActiveEffect(bool active)
+    {
+        if (thrustParticles == null) return;
+
+        if (active && !thrustParticles.isPlaying)
+            thrustParticles.Play();
+        else if (!active && thrustParticles.isPlaying)
+            thrustParticles.Stop();
+    }
+}
+
+// ========================================================
+// 3. النظام الشامل للبناء والقيادة والتأثيرات والحفظ
+// ========================================================
+public class VehicleBuilderSystem : MonoBehaviour
+{
+    public enum BuildObjectType { Block, Wheel, Thruster }
+    public enum BuildToolMode { Place, Delete }
+
+    [Header("القطع المتاحة (Prefabs)")]
+    public GameObject blockPrefab;    
+    public GameObject wheelPrefab;    
+    public GameObject thrusterPrefab; 
+
+    [Header("مواد المعاينة الشفافة (Preview Materials)")]
+    public Material previewValidMaterial;   
+
+    [Header("إعدادات الشبكة والطبقات")]
+    public LayerMask buildableLayer;
+    public float gridSize = 1.0f;
+
+    [Header("إعدادات الفيزياء والحركة")]
+    public float wheelSpeed = 1000f;
+    public float wheelTorque = 800f;
+    public float thrusterForce = 2500f;
+    public float steeringSpeedMultiplier = 0.6f;
+
+    [Header("إعدادات الكاميرا")]
+    public Transform cameraTransform;
+    public Vector3 cameraOffset = new Vector3(0, 5, -10);
+    public float cameraSmoothSpeed = 5f;
+
+    [Header("حالة اللعبة الحالية")]
+    public bool isPlayMode = false;
+    public BuildToolMode currentToolMode = BuildToolMode.Place;
+
+    [Header("مدخلات الجوال (Mobile Controls)")]
+    [Range(-1f, 1f)] public float mobileMoveInput = 0f;    
+    [Range(-1f, 1f)] public float mobileSteerInput = 0f;   
+    public bool isMobileThrusterActive = false;
+
+    private BuildObjectType currentSelectedType = BuildObjectType.Block;
+    private GameObject coreBlock; 
+    private Camera mainCam;
+    private GameObject previewObject;
+    private Vector2 touchStartPosition;
+    private float touchStartTime;
+    
+    private readonly List<GameObject> spawnedBlocks = new List<GameObject>();
+
+    void Start()
+    {
+        mainCam = Camera.main;
+        if (cameraTransform == null && mainCam != null)
+            cameraTransform = mainCam.transform;
         
-        /* UI Overlay */
-        #ui-layer {
-            position: absolute;
-            top: 0; left: 0; width: 100%; height: 100%;
-            pointer-events: none;
-            display: flex;
-            flex-direction: column;
-            justify-content: space-between;
-            padding: 20px;
+        SetPhysicsState(false);
+        UpdatePreviewObject();
+    }
+
+    void Update()
+    {
+        if (Input.GetKeyDown(KeyCode.Space)) TogglePlayMode();
+
+        if (!isPlayMode)
+        {
+            if (Input.GetKeyDown(KeyCode.Alpha1)) SelectBlockType(0);
+            if (Input.GetKeyDown(KeyCode.Alpha2)) SelectBlockType(1);
+            if (Input.GetKeyDown(KeyCode.Alpha3)) SelectBlockType(2);
+
+            HandlePreview();
+            HandleInput();
+        }
+        else
+        {
+            if (previewObject != null) previewObject.SetActive(false);
+        }
+    }
+
+    void FixedUpdate()
+    {
+        if (isPlayMode)
+        {
+            HandleWheelMovement();
+            HandleThrusterForce();
+            UpdateCameraFollow();
+        }
+    }
+
+    void HandlePreview()
+    {
+        if (previewObject == null) UpdatePreviewObject();
+
+        Vector2 mousePos = Input.mousePosition;
+        if (Input.touchCount > 0) mousePos = Input.GetTouch(0).position;
+
+        Ray ray = mainCam.ScreenPointToRay(mousePos);
+
+        if (Physics.Raycast(ray, out RaycastHit hit, 100f, buildableLayer) && !IsPointerOverUI())
+        {
+            previewObject.SetActive(currentToolMode == BuildToolMode.Place);
+            Vector3 spawnPosition = SnapToGrid(hit.point + hit.normal * (gridSize * 0.5f));
+            Quaternion spawnRotation = Quaternion.FromToRotation(Vector3.up, hit.normal);
+
+            previewObject.transform.position = spawnPosition;
+            previewObject.transform.rotation = spawnRotation;
+        }
+        else
+        {
+            previewObject.SetActive(false);
+        }
+    }
+
+    void UpdatePreviewObject()
+    {
+        if (previewObject != null) Destroy(previewObject);
+
+        GameObject prefab = GetSelectedPrefab();
+        if (prefab == null) return;
+
+        previewObject = Instantiate(prefab);
+        previewObject.name = "Build_Preview_Ghost";
+
+        foreach (Collider col in previewObject.GetComponentsInChildren<Collider>()) Destroy(col);
+        foreach (Rigidbody rb in previewObject.GetComponentsInChildren<Rigidbody>()) Destroy(rb);
+
+        if (previewValidMaterial != null)
+        {
+            foreach (Renderer rend in previewObject.GetComponentsInChildren<Renderer>())
+                rend.material = previewValidMaterial;
         }
 
-        .hud-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            color: #fff;
-            text-shadow: 0 0 10px rgba(0,255,255,0.8);
+        previewObject.SetActive(false);
+    }
+
+    void HandleInput()
+    {
+        if (Input.touchCount == 1)
+        {
+            Touch touch = Input.GetTouch(0);
+            if (IsPointerOverUI(touch.fingerId)) return;
+
+            if (touch.phase == TouchPhase.Began)
+            {
+                touchStartPosition = touch.position;
+                touchStartTime = Time.time;
+            }
+            else if (touch.phase == TouchPhase.Ended)
+            {
+                float touchDuration = Time.time - touchStartTime;
+                float touchDistance = Vector2.Distance(touch.position, touchStartPosition);
+
+                if (touchDuration < 0.3f && touchDistance < 20f)
+                {
+                    if (currentToolMode == BuildToolMode.Place)
+                        PlaceBlockAtPosition(touch.position);
+                    else
+                        DeleteBlockAtPosition(touch.position);
+                }
+            }
+            return;
         }
 
-        .speedometer {
-            font-size: 32px;
-            font-weight: bold;
-            background: rgba(0, 0, 0, 0.5);
-            padding: 10px 20px;
-            border-radius: 12px;
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            backdrop-filter: blur(5px);
+        if (Input.GetMouseButtonDown(0) && !IsPointerOverUI())
+        {
+            if (currentToolMode == BuildToolMode.Place)
+                PlaceBlockAtPosition(Input.mousePosition);
+            else
+                DeleteBlockAtPosition(Input.mousePosition);
         }
-
-        /* Controls Area */
-        #controls-container {
-            position: absolute;
-            bottom: 30px;
-            left: 30px;
-            width: 160px;
-            height: 160px;
-            pointer-events: auto;
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            grid-template-rows: repeat(3, 1fr);
-            gap: 5px;
+        else if (Input.GetMouseButtonDown(1) && !IsPointerOverUI())
+        {
+            DeleteBlockAtPosition(Input.mousePosition);
         }
+    }
 
-        .arrow-btn {
-            background: #2a3b4c;
-            border: 4px solid #1a2530;
-            border-radius: 8px;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            cursor: pointer;
-            box-shadow: inset 0 4px 0 #3a4f66, 0 6px 0 #0f1720;
-            transition: transform 0.05s, box-shadow 0.05s;
+    bool IsPointerOverUI(int fingerId = -1)
+    {
+        if (EventSystem.current == null) return false;
+        if (fingerId >= 0) return EventSystem.current.IsPointerOverGameObject(fingerId);
+        return EventSystem.current.IsPointerOverGameObject();
+    }
+
+    void PlaceBlockAtPosition(Vector2 screenPosition)
+    {
+        if (mainCam == null) return;
+        Ray ray = mainCam.ScreenPointToRay(screenPosition);
+
+        if (Physics.Raycast(ray, out RaycastHit hit, 100f, buildableLayer))
+        {
+            Vector3 spawnPosition = SnapToGrid(hit.point + hit.normal * (gridSize * 0.5f));
+            Quaternion spawnRotation = Quaternion.FromToRotation(Vector3.up, hit.normal);
+
+            GameObject prefabToSpawn = GetSelectedPrefab();
+            if (prefabToSpawn == null) return;
+
+            GameObject newBlock = Instantiate(prefabToSpawn, spawnPosition, spawnRotation);
+            spawnedBlocks.Add(newBlock);
+
+            Rigidbody newRb = newBlock.GetComponent<Rigidbody>();
+            if (newRb == null) newRb = newBlock.AddComponent<Rigidbody>();
+            newRb.isKinematic = !isPlayMode;
+
+            if (currentSelectedType == BuildObjectType.Thruster && newBlock.GetComponent<ThrusterComponent>() == null)
+                newBlock.AddComponent<ThrusterComponent>();
+
+            if (coreBlock == null) coreBlock = newBlock;
+
+            if (hit.collider.attachedRigidbody != null && hit.collider.gameObject != newBlock)
+            {
+                if (currentSelectedType == BuildObjectType.Block || currentSelectedType == BuildObjectType.Thruster)
+                {
+                    FixedJoint joint = newBlock.AddComponent<FixedJoint>();
+                    joint.connectedBody = hit.collider.attachedRigidbody;
+                }
+                else if (currentSelectedType == BuildObjectType.Wheel)
+                {
+                    HingeJoint hinge = newBlock.GetComponent<HingeJoint>();
+                    if (hinge == null) hinge = newBlock.AddComponent<HingeJoint>();
+                    hinge.connectedBody = hit.collider.attachedRigidbody;
+                }
+            }
         }
+    }
 
-        .arrow-btn:active, .arrow-btn.active {
-            transform: translateY(4px);
-            box-shadow: inset 0 2px 0 #3a4f66, 0 2px 0 #0f1720;
-            background: #34495e;
+    void DeleteBlockAtPosition(Vector2 screenPosition)
+    {
+        if (mainCam == null) return;
+        Ray ray = mainCam.ScreenPointToRay(screenPosition);
+
+        if (Physics.Raycast(ray, out RaycastHit hit, 100f))
+        {
+            GameObject target = hit.collider.gameObject;
+
+            if (spawnedBlocks.Contains(target))
+            {
+                if (target == coreBlock) coreBlock = null;
+
+                spawnedBlocks.Remove(target);
+                Destroy(target);
+
+                spawnedBlocks.RemoveAll(item => item == null);
+                if (coreBlock == null && spawnedBlocks.Count > 0) coreBlock = spawnedBlocks[0];
+            }
         }
+    }
 
-        /* Pixel-style Arrow Shapes */
-        .arrow-icon {
-            width: 0; height: 0;
-            border-style: solid;
-        }
-        .arrow-up .arrow-icon { border-width: 0 12px 18px 12px; border-color: transparent transparent #00f0ff transparent; }
-        .arrow-down .arrow-icon { border-width: 18px 12px 0 12px; border-color: #00f0ff transparent transparent transparent; }
-        .arrow-left .arrow-icon { border-width: 12px 18px 12px 0; border-color: transparent #00f0ff transparent transparent; }
-        .arrow-right .arrow-icon { border-width: 12px 0 12px 18px; border-color: transparent transparent transparent #00f0ff; }
+    public void SaveVehicle(string filename = "vehicle.json")
+    {
+        if (coreBlock == null || spawnedBlocks.Count == 0) return;
 
-        .arrow-up { grid-column: 2; grid-row: 1; }
-        .arrow-left { grid-column: 1; grid-row: 2; }
-        .arrow-down { grid-column: 2; grid-row: 3; }
-        .arrow-right { grid-column: 3; grid-row: 2; }
-    </style>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-</head>
-<body>
+        VehicleSaveData saveData = new VehicleSaveData();
 
-    <div id="canvas-container"></div>
+        foreach (GameObject block in spawnedBlocks)
+        {
+            if (block == null) continue;
 
-    <div id="ui-layer">
-        <div class="hud-header">
-            <div class="speedometer"><span id="speed">0</span> KM/H</div>
-        </div>
-
-        <div id="controls-container">
-            <div class="arrow-btn arrow-up" id="btn-up"><div class="arrow-icon"></div></div>
-            <div class="arrow-btn arrow-left" id="btn-left"><div class="arrow-icon"></div></div>
-            <div class="arrow-btn arrow-down" id="btn-down"><div class="arrow-icon"></div></div>
-            <div class="arrow-btn arrow-right" id="btn-right"><div class="arrow-icon"></div></div>
-        </div>
-    </div>
-
-    <script>
-        // Setup Three.js Scene
-        const container = document.getElementById('canvas-container');
-        const scene = new THREE.Scene();
-        scene.background = new THREE.Color(0x050811);
-        scene.fog = new THREE.FogExp2(0x050811, 0.015);
-
-        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
-        const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
-        renderer.setSize(window.innerWidth, window.innerHeight);
-        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-        renderer.shadowMap.enabled = true;
-        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-        container.appendChild(renderer.domElement);
-
-        // Lighting System for High Realism
-        const ambientLight = new THREE.AmbientLight(0xffffff, 0.2);
-        scene.add(ambientLight);
-
-        const dirLight = new THREE.DirectionalLight(0xffeedd, 1.5);
-        dirLight.position.set(50, 100, 50);
-        dirLight.castShadow = true;
-        dirLight.shadow.mapSize.width = 2048;
-        dirLight.shadow.mapSize.height = 2048;
-        scene.add(dirLight);
-
-        // Street Lights Simulation
-        const lightOrange = new THREE.PointLight(0xffaa44, 2, 50);
-        lightOrange.position.set(0, 10, -20);
-        scene.add(lightOrange);
-
-        // Realistic Road Environment
-        const roadGeometry = new THREE.PlaneGeometry(20, 1000);
-        const roadMaterial = new THREE.MeshStandardMaterial({ 
-            color: 0x111115, 
-            roughness: 0.4,
-            metalness: 0.1
-        });
-        const road = new THREE.Mesh(roadGeometry, roadMaterial);
-        road.rotation.x = -Math.PI / 2;
-        road.receiveShadow = true;
-        scene.add(road);
-
-        // Procedural High-Detail Sports Car
-        const carGroup = new THREE.Group();
-        
-        // Car Body Material (Metallic Paint)
-        const bodyMaterial = new THREE.MeshPhysicalMaterial({
-            color: 0xdc143c,
-            metalness: 0.9,
-            roughness: 0.1,
-            clearcoat: 1.0,
-            clearcoatRoughness: 0.1
-        });
-
-        // Chassis
-        const bodyGeo = new THREE.BoxGeometry(2, 0.6, 4.5);
-        const bodyMesh = new THREE.Mesh(bodyGeo, bodyMaterial);
-        bodyMesh.position.y = 0.5;
-        bodyMesh.castShadow = true;
-        carGroup.add(bodyMesh);
-
-        // Cabin
-        const cabinGeo = new THREE.BoxGeometry(1.6, 0.5, 2);
-        const glassMat = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.1, metalness: 0.9 });
-        const cabinMesh = new THREE.Mesh(cabinGeo, glassMat);
-        cabinMesh.position.set(0, 0.9, -0.2);
-        carGroup.add(cabinMesh);
-
-        // Headlights
-        const headlightMat = new THREE.MeshBasicMaterial({ color: 0x00ffff });
-        const hlLeft = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.15, 0.1), headlightMat);
-        hlLeft.position.set(-0.7, 0.5, -2.25);
-        const hlRight = hlLeft.clone();
-        hlRight.position.x = 0.7;
-        carGroup.add(hlLeft, hlRight);
-
-        // Headlight Beams
-        const spotLightL = new THREE.SpotLight(0xffffff, 5, 40, Math.PI / 6, 0.5);
-        spotLightL.position.set(-0.7, 0.5, -2.2);
-        spotLightL.target.position.set(-0.7, 0, -10);
-        carGroup.add(spotLightL, spotLightL.target);
-
-        const spotLightR = spotLightL.clone();
-        spotLightR.position.x = 0.7;
-        spotLightR.target.position.set(0.7, 0, -10);
-        carGroup.add(spotLightR, spotLightR.target);
-
-        scene.add(carGroup);
-
-        // Controls Logic
-        const keys = { ArrowUp: false, ArrowDown: false, ArrowLeft: false, ArrowRight: false };
-
-        function bindKey(id, keyName) {
-            const el = document.getElementById(id);
-            const setKey = (val) => {
-                keys[keyName] = val;
-                el.classList.toggle('active', val);
+            BlockData data = new BlockData
+            {
+                localPosition = coreBlock.transform.InverseTransformPoint(block.transform.position),
+                localRotation = Quaternion.Inverse(coreBlock.transform.rotation) * block.transform.rotation
             };
-            el.addEventListener('mousedown', () => setKey(true));
-            el.addEventListener('mouseup', () => setKey(false));
-            el.addEventListener('touchstart', (e) => { e.preventDefault(); setKey(true); });
-            el.addEventListener('touchend', (e) => { e.preventDefault(); setKey(false); });
+
+            if (block.GetComponent<HingeJoint>() != null) data.blockType = 1;
+            else if (block.GetComponent<ThrusterComponent>() != null) data.blockType = 2;
+            else data.blockType = 0;
+
+            saveData.blocks.Add(data);
         }
 
-        bindKey('btn-up', 'ArrowUp');
-        bindKey('btn-down', 'ArrowDown');
-        bindKey('btn-left', 'ArrowLeft');
-        bindKey('btn-right', 'ArrowRight');
+        string json = JsonUtility.ToJson(saveData, true);
+        string path = Path.Combine(Application.persistentDataPath, filename);
+        File.WriteAllText(path, json);
+        Debug.Log("تم الحفظ بنجاح في: " + path);
+    }
 
-        window.addEventListener('keydown', (e) => { if (keys.hasOwnProperty(e.key)) keys[e.key] = true; });
-        window.addEventListener('keyup', (e) => { if (keys.hasOwnProperty(e.key)) keys[e.key] = false; });
+    public void LoadVehicle(string filename = "vehicle.json")
+    {
+        string path = Path.Combine(Application.persistentDataPath, filename);
+        if (!File.Exists(path)) return;
 
-        // Physics & Animation Loop
-        let speed = 0;
-        const maxSpeed = 2.2;
-        const accel = 0.03;
-        const friction = 0.98;
-        let carX = 0;
+        ClearVehicle();
 
-        function animate() {
-            requestAnimationFrame(animate);
+        string json = File.ReadAllText(path);
+        VehicleSaveData saveData = JsonUtility.FromJson<VehicleSaveData>(json);
 
-            // Driving Physics
-            if (keys.ArrowUp) speed = Math.min(speed + accel, maxSpeed);
-            if (keys.ArrowDown) speed = Math.max(speed - accel, -maxSpeed * 0.4);
+        if (saveData.blocks.Count == 0) return;
 
-            speed *= friction;
+        Vector3 basePos = transform.position;
 
-            if (keys.ArrowLeft && Math.abs(speed) > 0.05) carX -= 0.12 * (speed / maxSpeed);
-            if (keys.ArrowRight && Math.abs(speed) > 0.05) carX += 0.12 * (speed / maxSpeed);
+        for (int i = 0; i < saveData.blocks.Count; i++)
+        {
+            BlockData data = saveData.blocks[i];
+            GameObject prefab = (data.blockType == 1) ? wheelPrefab : (data.blockType == 2) ? thrusterPrefab : blockPrefab;
 
-            // Boundaries
-            carX = Math.max(-8, Math.min(8, carX));
+            Vector3 spawnPos = basePos + data.localPosition;
+            GameObject newBlock = Instantiate(prefab, spawnPos, data.localRotation);
+            spawnedBlocks.Add(newBlock);
 
-            carGroup.position.x = carX;
-            carGroup.position.z -= speed;
+            Rigidbody rb = newBlock.GetComponent<Rigidbody>();
+            if (rb == null) rb = newBlock.AddComponent<Rigidbody>();
+            rb.isKinematic = !isPlayMode;
 
-            // Camera Tracking
-            camera.position.x = carGroup.position.x;
-            camera.position.y = carGroup.position.y + 3;
-            camera.position.z = carGroup.position.z + 8;
-            camera.lookAt(carGroup.position.x, carGroup.position.y + 1, carGroup.position.z - 5);
+            if (data.blockType == 2 && newBlock.GetComponent<ThrusterComponent>() == null)
+                newBlock.AddComponent<ThrusterComponent>();
 
-            // Speedometer UI
-            document.getElementById('speed').innerText = Math.round(Math.abs(speed) * 120);
-
-            renderer.render(scene, camera);
+            if (i == 0) coreBlock = newBlock;
         }
 
-        animate();
+        RebuildJoints();
+    }
 
-        // Responsive Resize
-        window.addEventListener('resize', () => {
-            camera.aspect = window.innerWidth / window.innerHeight;
-            camera.updateProjectionMatrix();
-            renderer.setSize(window.innerWidth, window.innerHeight);
-        });
-    </script>
-</body>
-</html>
+    void RebuildJoints()
+    {
+        for (int i = 1; i < spawnedBlocks.Count; i++)
+        {
+            GameObject block = spawnedBlocks[i];
+            if (block == null) continue;
 
+            if (block.GetComponent<ThrusterComponent>() == null && block.GetComponent<HingeJoint>() == null)
+            {
+                FixedJoint joint = block.AddComponent<FixedJoint>();
+                joint.connectedBody = coreBlock.GetComponent<Rigidbody>();
+            }
+            else if (block.GetComponent<HingeJoint>() != null)
+            {
+                HingeJoint hinge = block.GetComponent<HingeJoint>();
+                hinge.connectedBody = coreBlock.GetComponent<Rigidbody>();
+            }
+        }
+    }
+
+    public void ClearVehicle()
+    {
+        foreach (GameObject block in spawnedBlocks) if (block != null) Destroy(block);
+        spawnedBlocks.Clear();
+        coreBlock = null;
+    }
+
+    public void SelectBlockType(int typeIndex)
+    {
+        currentSelectedType = (BuildObjectType)typeIndex;
+        currentToolMode = BuildToolMode.Place;
+        UpdatePreviewObject();
+    }
+
+    public void SetToolMode(int modeIndex) => currentToolMode = (BuildToolMode)modeIndex;
+
+    public void TogglePlayMode()
+    {
+        isPlayMode = !isPlayMode;
+        SetPhysicsState(isPlayMode);
+    }
+
+    public void SetMobileMoveInput(float value) => mobileMoveInput = value;
+    public void SetMobileSteerInput(float value) => mobileSteerInput = value;
+    public void SetMobileThruster(bool active) => isMobileThrusterActive = active;
+
+    void SetPhysicsState(bool enablePhysics)
+    {
+        foreach (GameObject block in spawnedBlocks)
+        {
+            if (block != null)
+            {
+                Rigidbody rb = block.GetComponent<Rigidbody>();
+                if (rb != null) rb.isKinematic = !enablePhysics;
+            }
+        }
+    }
+
+    void HandleWheelMovement()
+    {
+        float moveInput = Input.GetAxis("Vertical");
+        if (Mathf.Abs(mobileMoveInput) > 0.05f) moveInput = mobileMoveInput;
+
+        float steerInput = Input.GetAxis("Horizontal");
+        if (Mathf.Abs(mobileSteerInput) > 0.05f) steerInput = mobileSteerInput;
+
+        foreach (GameObject block in spawnedBlocks)
+        {
+            if (block != null)
+            {
+                HingeJoint hinge = block.GetComponent<HingeJoint>();
+                if (hinge != null)
+                {
+                    JointMotor motor = hinge.motor;
+                    motor.maxMotorTorque = wheelTorque;
+
+                    if (Mathf.Abs(moveInput) > 0.05f || Mathf.Abs(steerInput) > 0.05f)
+                    {
+                        float localX = 0f;
+                        if (coreBlock != null)
+                        {
+                            Vector3 localPos = coreBlock.transform.InverseTransformPoint(block.transform.position);
+                            localX = localPos.x;
+                        }
+
+                        float steerModifier = (localX >= 0) ? -steerInput : steerInput;
+                        float calculatedSpeed = (moveInput * wheelSpeed) + (steerModifier * wheelSpeed * steeringSpeedMultiplier);
+
+                        motor.targetVelocity = calculatedSpeed;
+                        hinge.motor = motor;
+                        hinge.useMotor = true;
+                    }
+                    else
+                    {
+                        motor.targetVelocity = 0f;
+                        hinge.motor = motor;
+                        hinge.useMotor = true;
+                    }
+                }
+            }
+        }
+    }
+
+    void HandleThrusterForce()
+    {
+        bool isThrusting = Input.GetKey(KeyCode.LeftShift) || isMobileThrusterActive;
+
+        foreach (GameObject block in spawnedBlocks)
+        {
+            if (block != null)
+            {
+                ThrusterComponent thruster = block.GetComponent<ThrusterComponent>();
+                if (thruster != null)
+                {
+                    thruster.SetActiveEffect(isThrusting);
+
+                    if (isThrusting)
+                    {
+                        Rigidbody rb = block.GetComponent<Rigidbody>();
+                        if (rb != null) rb.AddForce(block.transform.forward * thrusterForce, ForceMode.Force);
+                    }
+                }
+            }
+        }
+    }
+
+    void UpdateCameraFollow()
+    {
+        if (coreBlock != null && cameraTransform != null)
+        {
+            Vector3 targetPosition = coreBlock.transform.position + cameraOffset;
+            cameraTransform.position = Vector3.Lerp(cameraTransform.position, targetPosition, cameraSmoothSpeed * Time.fixedDeltaTime);
+            cameraTransform.LookAt(coreBlock.transform.position);
+        }
+    }
+
+    GameObject GetSelectedPrefab()
+    {
+        switch (currentSelectedType)
+        {
+            case BuildObjectType.Block: return blockPrefab;
+            case BuildObjectType.Wheel: return wheelPrefab;
+            case BuildObjectType.Thruster: return thrusterPrefab;
+            default: return blockPrefab;
+        }
+    }
+
+    Vector3 SnapToGrid(Vector3 position)
+    {
+        return new Vector3(
+            Mathf.Round(position.x / gridSize) * gridSize,
+            Mathf.Round(position.y / gridSize) * gridSize,
+            Mathf.Round(position.z / gridSize) * gridSize
+        );
+    }
+}
+
+// ========================================================
+// 4. عصا التحكم بالجوال (Virtual Joystick)
+// ========================================================
+public class VirtualJoystick : MonoBehaviour, IDragHandler, IPointerDownHandler, IPointerUpHandler
+{
+    [Header("عناصر الـ UI")]
+    public RectTransform joystickBackground;
+    public RectTransform joystickHandle;
+
+    [Header("إعدادات الحركة")]
+    public float handleRange = 1f;
+
+    [Header("ربط نظام Builder System")]
+    public VehicleBuilderSystem vehicleBuilderSystem;
+
+    private Vector2 inputVector = Vector2.zero;
+
+    void Start()
+    {
+        if (joystickBackground == null) joystickBackground = GetComponent<RectTransform>();
+        if (vehicleBuilderSystem == null) vehicleBuilderSystem = FindObjectOfType<VehicleBuilderSystem>();
+    }
+
+    public void OnDrag(PointerEventData eventData)
+    {
+        Vector2 bgSize = joystickBackground.rect.size;
+        
+        if (RectTransformUtility.ScreenPointToLocalPointInRectangle(
+            joystickBackground, 
+            eventData.position, 
+            eventData.pressEventCamera, 
+            out Vector2 pos))
+        {
+            pos.x = (pos.x / bgSize.x) * 2f;
+            pos.y = (pos.y / bgSize.y) * 2f;
+
+            inputVector = new Vector2(pos.x, pos.y);
+            inputVector = (inputVector.magnitude > 1.0f) ? inputVector.normalized : inputVector;
+
+            if (joystickHandle != null)
+            {
+                joystickHandle.anchoredPosition = new Vector2(
+                    inputVector.x * (bgSize.x / 2f) * handleRange,
+                    inputVector.y * (bgSize.y / 2f) * handleRange
+                );
+            }
+
+            SendInputToVehicle();
+        }
+    }
+
+    public void OnPointerDown(PointerEventData eventData) => OnDrag(eventData);
+
+    public void OnPointerUp(PointerEventData eventData)
+    {
+        inputVector = Vector2.zero;
+        if (joystickHandle != null) joystickHandle.anchoredPosition = Vector2.zero;
+        SendInputToVehicle();
+    }
+
+    void SendInputToVehicle()
+    {
+        if (vehicleBuilderSystem != null)
+        {
+            vehicleBuilderSystem.SetMobileSteerInput(inputVector.x);
+            vehicleBuilderSystem.SetMobileMoveInput(inputVector.y);
+        }
+    }
+}
+
+// ========================================================
+// 5. كاميرا البناء والتحويط (Build Camera Controller)
+// ========================================================
+public class BuildCameraController : MonoBehaviour
+{
+    [Header("الهدف والإعدادات الأساسية")]
+    public Transform target;
+    public float distance = 10.0f;
+
+    [Header("سرعة الدوران")]
+    public float xSpeed = 120.0f;
+    public float ySpeed = 120.0f;
+    public float yMinLimit = -20f;
+    public float yMaxLimit = 80f;
+
+    [Header("إعدادات التقريب (Zoom)")]
+    public float zoomSpeed = 2f;
+    public float minDistance = 3f;
+    public float maxDistance = 20f;
+
+    private float x = 0.0f;
+    private float y = 0.0f;
+
+    void Start()
+    {
+        Vector3 angles = transform.eulerAngles;
+        x = angles.y;
+        y = angles.x;
+    }
+
+    void LateUpdate()
+    {
+        if (target == null) return;
+
+        if ((Input.GetMouseButton(1) || Input.GetMouseButton(2)) && !IsPointerOverUI())
+        {
+            x += Input.GetAxis("Mouse X") * xSpeed * 0.02f;
+            y -= Input.GetAxis("Mouse Y") * ySpeed * 0.02f;
+        }
+
+        float scroll = Input.GetAxis("Mouse ScrollWheel");
+        if (Mathf.Abs(scroll) > 0.01f)
+        {
+            distance = Mathf.Clamp(distance - scroll * zoomSpeed * 5f, minDistance, maxDistance);
+        }
+
+        HandleTouchControls();
+
+        y = Mathf.Clamp(y, yMinLimit, yMaxLimit);
+
+        Quaternion rotation = Quaternion.Euler(y, x, 0);
+        Vector3 position = rotation * new Vector3(0.0f, 0.0f, -distance) + target.position;
+
+        transform.rotation = rotation;
+        transform.position = position;
+    }
+
+    void HandleTouchControls()
+    {
+        if (Input.touchCount == 1)
+        {
+            Touch touch = Input.GetTouch(0);
+
+            if (touch.phase == TouchPhase.Moved && !IsPointerOverUI(touch.fingerId))
+            {
+                x += touch.deltaPosition.x * xSpeed * 0.005f;
+                y -= touch.deltaPosition.y * ySpeed * 0.005f;
+            }
+        }
+        else if (Input.touchCount == 2)
+        {
+            Touch touchZero = Input.GetTouch(0);
+            Touch touchOne = Input.GetTouch(1);
+
+            Vector2 touchZeroPrevPos = touchZero.position - touchZero.deltaPosition;
+            Vector2 touchOnePrevPos = touchOne.position - touchOne.deltaPosition;
+
+            float prevTouchDeltaMag = (touchZeroPrevPos - touchOnePrevPos).magnitude;
+            float touchDeltaMag = (touchZero.position - touchOne.position).magnitude;
+
+            float deltaMagnitudeDiff = prevTouchDeltaMag - touchDeltaMag;
+            distance = Mathf.Clamp(distance + deltaMagnitudeDiff * zoomSpeed * 0.01f, minDistance, maxDistance);
+        }
+    }
+
+    bool IsPointerOverUI(int fingerId = -1)
+    {
+        if (EventSystem.current == null) return false;
+        if (fingerId >= 0) return EventSystem.current.IsPointerOverGameObject(fingerId);
+        return EventSystem.current.IsPointerOverGameObject();
+    }
+}
